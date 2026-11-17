@@ -60,7 +60,7 @@ def test_invalid_output_is_not_written(tmp_path):
 
 def test_changed_keypoints_stop_batch_job(monkeypatch):
     from frdv.cli import retarget
-    monkeypatch.setattr(retarget,'_W',dict(cfg={},height=1.,keypoints=['pelvis','left_ankle']))
+    monkeypatch.setattr(retarget,'_W',dict(cfg={'fail_fast':True},height=1.,keypoints=['pelvis','left_ankle']))
     monkeypatch.setattr(retarget,'prepare',lambda *args:SimpleNamespace(keypoints=['pelvis']))
     with pytest.raises(ValidationError,match='bad.bvh.*keypoints differ') as error:
         retarget._job('bad.bvh')
@@ -82,10 +82,63 @@ def test_thread_validation_failure_stops_pending_files(monkeypatch,ik_cfg):
     monkeypatch.setattr(_native,'supported',lambda p:True)
     monkeypatch.setattr(_native,'Solver',FakeSolver)
     monkeypatch.setattr(retarget,'prepare',prepare)
-    cfg = dict(solver={'despike':{'enabled':False}})
+    cfg = dict(solver={'despike':{'enabled':False}},fail_fast=True)
     with pytest.raises(ValidationError,match='bad.bvh.*NaN'):
         retarget._run_threads(['bad.bvh','later.bvh'],cfg,1.,1)
     assert calls == ['bad.bvh']
+
+
+def test_invalid_clip_is_reported_and_batch_job_goes_on(monkeypatch,tmp_path):
+    from frdv.cli import retarget
+    path = str(tmp_path/'s1'/'walk.bvh')
+    monkeypatch.setattr(retarget,'_W',dict(cfg={'data':str(tmp_path)},height=1.,keypoints=['pelvis','left_ankle']))
+    monkeypatch.setattr(retarget,'prepare',lambda *args:SimpleNamespace(keypoints=['pelvis']))
+    name,frames,*_,error = retarget._job(path)
+    assert (name,frames) == ('walk.bvh',0)
+    assert error.startswith('ValidationError: tracked keypoints differ') and path not in error
+
+
+def test_thread_validation_failure_is_reported_and_other_files_are_processed(monkeypatch,ik_cfg,tmp_path):
+    from frdv.cli import retarget
+    r = Retargeter(ik_cfg)
+    class FakeSolver:
+        def __init__(self,problem): self.p0 = np.zeros((problem.S,3))
+        def workspace(self): return None
+        def run(self,cfg,targets,wsp): return np.tile(r.problem.q_nominal,(len(targets),1))
+    bad,good = str(tmp_path/'s1'/'walk.bvh'),str(tmp_path/'s2'/'walk.bvh')
+    def prepare(path,*args):
+        if path == bad:
+            raise ValidationError(f'{path}: targets contain NaN')
+        return SimpleNamespace(keypoints=[],X=np.zeros((3,r.problem.S,3)),fps=30.)
+    saved = []
+    monkeypatch.setattr(retarget,'_W',dict(r=r,ik=ik_cfg,keypoints=[],joints=[]))
+    monkeypatch.setattr(_native,'supported',lambda p:True)
+    monkeypatch.setattr(_native,'Solver',FakeSolver)
+    monkeypatch.setattr(retarget,'prepare',prepare)
+    monkeypatch.setattr(retarget,'_save',lambda path,*args:saved.append(path) or 'out')
+    cfg = dict(solver={'despike':{'enabled':False}},data=str(tmp_path),out=str(tmp_path/'out'))
+    results = retarget._run_threads([bad,good],cfg,1.,1)
+    assert results[0] == ('walk.bvh',0,0.,0.,'ValidationError: targets contain NaN')
+    assert results[1][0] == 'out' and results[1][1] == 3 and results[1][4] is None
+    assert saved == [good]
+
+
+def test_first_clip_skips_clips_that_fail_unless_fail_fast(monkeypatch,tmp_path):
+    from frdv.cli import retarget
+    files = [str(tmp_path/'s1'/'walk.npz'),str(tmp_path/'s2'/'walk.npz'),str(tmp_path/'s3'/'walk.npz')]
+    def prepare(path,*args):
+        if path != files[2]:
+            raise ValidationError(f'{path}: AMASS betas must have shape (16,); got (300,)')
+        return 'targets'
+    monkeypatch.setattr(retarget,'prepare',prepare)
+    cfg = dict(data=str(tmp_path))
+    first,tg,failed = retarget._first_clip(files,cfg,1.)
+    assert (first,tg) == (files[2],'targets')
+    assert [f[0] for f in failed] == ['walk.npz','walk.npz']
+    assert failed[0][4] == 'ValidationError: AMASS betas must have shape (16,); got (300,)'
+    assert retarget._first_clip(files[:2],cfg,1.) == (None,None,failed)
+    with pytest.raises(ValidationError,match='s1/walk.npz: AMASS betas'):
+        retarget._first_clip(files,dict(cfg,fail_fast=True),1.)
 
 
 def test_bad_bvh_frame_time_and_nan_are_rejected(tmp_path):

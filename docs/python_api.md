@@ -162,6 +162,7 @@ Pass these as command-line overrides or strings in `compose([...])`:
 | `mode=chunks` | Explicitly split an individual clip over worker processes. |
 | `start=0 end=300` | Select frames; `end` is exclusive. |
 | `save_skeleton=true` | Include the scaled source skeleton for inspection in the viewer. |
+| `fail_fast=true` | Stop at the first clip that fails validation. By default a failed clip is reported and the other clips are processed; the exit status is nonzero if any clip failed. A single motion file always stops. |
 
 The default worker count is the available CPU count. Within-file chunking is disabled by default.
 Chunk mode has a separate execution path: `stitch.burn_in` discards lead-in frames, and the solver

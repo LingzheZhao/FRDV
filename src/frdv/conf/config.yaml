@@ -19,6 +19,8 @@ workers: null             # threads (or processes); null = all cores
 mode: auto                # whole files: parallel across clips, sequential for a single clip
 threads: true             # files/sequential: whole clips on threads with the compiled clip solver
                           # (native C build, else numba); false = the per-frame solver in processes
+fail_fast: false          # stop at the first clip that fails validation; false = report it as FAILED
+                          # and go on with the other clips (a single motion file always stops)
 save_skeleton: false      # also store the scaled source skeleton (for the viewer)
 vis: false                # open the viewer when done
 port: 8080

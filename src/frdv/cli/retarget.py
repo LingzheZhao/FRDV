@@ -51,6 +51,14 @@ def _clip_error(path, error):
     return ValidationError(message if message.startswith(f"{path}:") else f"{path}: {message}")
 
 
+def _failed_result(path, error):
+    """Per-clip result tuple of a failed clip; the error message drops its path prefix."""
+    message = str(error)
+    if message.startswith(f"{path}: "):
+        message = message[len(path) + 2:]
+    return os.path.basename(path), 0, 0.0, 0.0, f"{type(error).__name__}: {message}"
+
+
 def prepare(path: str, cfg: dict, height: float, keep_skeleton=False):
     ds, rb = cfg["dataset"], cfg["robot"]
     try:
@@ -139,9 +147,25 @@ def _job(path):
         name = _save(path, _W["cfg"]["out"], tg, q, _W["cfg"], _W["ik"], _W["joints"])
         return name, len(q), t1 - t0, t2 - t1, None
     except ValidationError as error:
+        if not _W["cfg"].get("fail_fast"):
+            return _failed_result(path, error)
         raise _clip_error(path, error) from error
     except Exception as e:  # keep the batch going for other file errors
         return os.path.basename(path), 0, 0.0, 0.0, f"{type(e).__name__}: {e}"
+
+
+def _first_clip(files, c, height):
+    """(path, targets, failed results) for the first clip that loads; the clips before it that fail are
+    returned as failed results, or raise when fail_fast is set. (None, None, failed results) if none loads."""
+    failed = []
+    for path in files:
+        try:
+            return path, prepare(path, c, height, c.get("save_skeleton", False)), failed
+        except Exception as error:
+            if c.get("fail_fast"):
+                raise
+            failed.append(_failed_result(path, error))
+    return None, None, failed
 
 
 def _fused_ok(c, height, keypoints) -> bool:
@@ -246,6 +270,8 @@ def _run_threads(files, c, height, workers, first=(None, None)):
             t3 = time.perf_counter()
             return name, len(q), t1 - t0, t2 - t1, None, t3 - t2, time.thread_time() - c0, t3, threading.get_ident()
         except ValidationError as error:
+            if not c.get("fail_fast"):
+                return _failed_result(path, error) + (0.0, 0.0, time.perf_counter(), 0)
             if not failures:
                 failures.append(_clip_error(path, error))
             abort.set()
@@ -305,6 +331,7 @@ def run(cfg) -> int:
         print(f"no files matching '{c['dataset'].get('glob')}' in {c['data']}")
         return 2
     validate_subject_input(c, files)
+    c["fail_fast"] = bool(c.get("fail_fast")) or len(files) == 1
     out = os.path.abspath(os.path.expanduser(c["out"]))
     from .diagnostics import warn_source_overwrite
     warn_source_overwrite(files, out, resolve_path(c['data']))
@@ -328,13 +355,18 @@ def run(cfg) -> int:
 
     _tick("robot validated, calibration found")
     # Tracked keypoints = robot keypoints present in the dataset map (checked on the first clip).
-    files_in = list(files)
-    tg0 = prepare(files[0], c, height, c.get("save_skeleton", False))
+    first, tg0, failed = _first_clip(files, c, height)
+    if tg0 is None:
+        for n, *_, e in failed:
+            print(f"[frdv] FAILED {n}: {e}")
+        print(f"[frdv] 0/{len(failed)} clips: no clip could be loaded")
+        return 1
+    files = files[len(failed):]
     _tick("first clip loaded")
     keypoints = tg0.keypoints
     skipped = [k for k, v in c["robot"]["keypoints"].items()
                if k not in keypoints and not v.get("calibrate")]
-    print(f"[frdv] robot={c['robot']['name']} dataset={c['dataset']['name']}  {len(files)} file(s) -> {out}")
+    print(f"[frdv] robot={c['robot']['name']} dataset={c['dataset']['name']}  {len(failed) + len(files)} file(s) -> {out}")
     scale_label = "manual source XYZ scale" if c["dataset"].get("scale", {}).get("mode") == "manual" else "scale"
     print(f"[frdv] tracking {len(keypoints)} keypoints; robot height {height:.2f} m, "
           f"performer {tg0.human_height:.2f} m " + (_seg_report(tg0) if tg0.segment_scale else
@@ -375,7 +407,7 @@ def run(cfg) -> int:
                 print(f"[frdv] {results[-1][0]}: {rep}")
     elif mode in ("sequential", "files") and (workers == 1 or len(files) == 1 or mode == "sequential") \
             and _fused_ok(c, height, keypoints):
-        results = _run_threads(files, c, height, 1, first=(files_in[0], tg0))
+        results = _run_threads(files, c, height, 1, first=(first, tg0))
     elif mode == "sequential" or workers == 1 or len(files) == 1:
         _init(c, height, keypoints)
         for path in files:
@@ -384,7 +416,7 @@ def run(cfg) -> int:
         # One process, one thread per worker: the whole clip (solve + despike) runs in one GIL-free
         # compiled call, so there is no process start-up and nothing to pickle.
         files.sort(key=os.path.getsize, reverse=True)  # longest first: better load balance
-        results = _run_threads(files, c, height, workers, first=(files_in[0], tg0))
+        results = _run_threads(files, c, height, workers, first=(first, tg0))
     elif mode == "files":
         files.sort(key=os.path.getsize, reverse=True)  # longest first: better load balance
         # Compile the numba kernels once here; the workers then load them from numba's on-disk
@@ -404,6 +436,7 @@ def run(cfg) -> int:
         return 2
     wall = time.perf_counter() - t_start
     _tick("all clips done")
+    results = failed + results
 
     errors = [(n, e) for n, *_, e in results if e]
     for n, e in errors:
