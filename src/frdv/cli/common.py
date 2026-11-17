@@ -275,6 +275,17 @@ def validate_robot(robot: dict) -> list[str]:
     key = robot.get("nominal_key")
     if key and mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, key) < 0:
         problems.append(f"nominal_key '{key}' is not a keyframe")
+    # self-collision constraints are built between capsule geoms only: a pair without one builds nothing
+    capsule_bodies = {int(model.geom_bodyid[g]) for g in range(model.ngeom)
+                      if model.geom_type[g] == mujoco.mjtGeom.mjGEOM_CAPSULE}
+    for pair in (robot.get("self_collision") or {}).get("pairs") or []:
+        for b in pair:
+            i = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, b)
+            if i < 0:
+                problems.append(f"self_collision pair {list(pair)}: no body named '{b}'")
+            elif i not in capsule_bodies:
+                problems.append(f"self_collision pair {list(pair)}: body '{b}' has no capsule geom, "
+                                "so the pair builds no constraint")
     return problems
 
 

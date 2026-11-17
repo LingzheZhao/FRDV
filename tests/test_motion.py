@@ -92,6 +92,23 @@ def test_configs_compose_and_validate():
     assert ik.accel_weight == 7.0 and ik.targets == ["pelvis", "left_knee_link"]
 
 
+def test_self_collision_pairs_that_build_nothing_are_reported(ik_cfg):
+    from frdv.cli.common import validate_robot
+    from frdv.retarget import IKProblem
+    ok, sphere, empty, missing = (["L_shank_link", "R_shank_link"], ["l_shoulder_site", "torso_link"],
+                                  ["L_hipyaw_link", "R_shank_link"], ["L_shank_link", "no_such_body"])
+    robot = lambda pairs: {"xml": ik_cfg.xml_path, "self_collision": {"pairs": pairs}}  # noqa: E731
+    assert validate_robot(robot([])) == [] and validate_robot(robot([ok])) == []
+    assert validate_robot(robot([ok, sphere, empty, missing])) == [
+        f"self_collision pair {sphere}: body 'l_shoulder_site' has no capsule geom, so the pair builds no constraint",
+        f"self_collision pair {empty}: body 'L_hipyaw_link' has no capsule geom, so the pair builds no constraint",
+        f"self_collision pair {missing}: no body named 'no_such_body'"]
+    # the reported pairs are exactly those the solver builds no constraint for
+    assert len(IKProblem(replace(ik_cfg, self_collision_pairs=[tuple(ok)])).pairs) > 0
+    for pair in (sphere, empty, missing):
+        assert IKProblem(replace(ik_cfg, self_collision_pairs=[tuple(pair)])).pairs == []
+
+
 def test_new_robot_guesses_g1():
     import mujoco
     from conftest import menagerie_or_skip
