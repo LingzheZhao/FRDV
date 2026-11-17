@@ -51,12 +51,18 @@ def _clip_error(path, error):
     return ValidationError(message if message.startswith(f"{path}:") else f"{path}: {message}")
 
 
-def _failed_result(path, error):
+def _relative_path(path, cfg):
+    """Path of a clip relative to the data folder, or its basename when `data` is one motion file."""
+    data_root = resolve_path(cfg["data"])
+    return os.path.relpath(path, data_root) if os.path.isdir(data_root) else os.path.basename(path)
+
+
+def _failed_result(path, error, cfg):
     """Per-clip result tuple of a failed clip; the error message drops its path prefix."""
     message = str(error)
     if message.startswith(f"{path}: "):
         message = message[len(path) + 2:]
-    return os.path.basename(path), 0, 0.0, 0.0, f"{type(error).__name__}: {message}"
+    return _relative_path(path, cfg), 0, 0.0, 0.0, f"{type(error).__name__}: {message}"
 
 
 def prepare(path: str, cfg: dict, height: float, keep_skeleton=False):
@@ -92,9 +98,7 @@ def _save(path, out_dir, tg, q, cfg, ik, joint_names):
     from ..utils import continuous_quaternions
     q = trajectory_array(q, len(tg.X), len(ik.q_nominal) if getattr(ik, 'q_nominal', None) is not None else None)
     continuous_quaternions(q)
-    data_root = resolve_path(cfg["data"])
-    relative = os.path.relpath(path, data_root) if os.path.isdir(data_root) else os.path.basename(path)
-    name = os.path.splitext(relative)[0]
+    name = os.path.splitext(_relative_path(path, cfg))[0]
     destination = os.path.join(out_dir, f"{name}.npz")
     os.makedirs(os.path.dirname(destination), exist_ok=True)
     extra = {}
@@ -148,10 +152,10 @@ def _job(path):
         return name, len(q), t1 - t0, t2 - t1, None
     except ValidationError as error:
         if not _W["cfg"].get("fail_fast"):
-            return _failed_result(path, error)
+            return _failed_result(path, error, _W["cfg"])
         raise _clip_error(path, error) from error
     except Exception as e:  # keep the batch going for other file errors
-        return os.path.basename(path), 0, 0.0, 0.0, f"{type(e).__name__}: {e}"
+        return _relative_path(path, _W["cfg"]), 0, 0.0, 0.0, f"{type(e).__name__}: {e}"
 
 
 def _first_clip(files, c, height):
@@ -164,7 +168,7 @@ def _first_clip(files, c, height):
         except Exception as error:
             if c.get("fail_fast"):
                 raise
-            failed.append(_failed_result(path, error))
+            failed.append(_failed_result(path, error, c))
     return None, None, failed
 
 
@@ -271,13 +275,13 @@ def _run_threads(files, c, height, workers, first=(None, None)):
             return name, len(q), t1 - t0, t2 - t1, None, t3 - t2, time.thread_time() - c0, t3, threading.get_ident()
         except ValidationError as error:
             if not c.get("fail_fast"):
-                return _failed_result(path, error) + (0.0, 0.0, time.perf_counter(), 0)
+                return _failed_result(path, error, c) + (0.0, 0.0, time.perf_counter(), 0)
             if not failures:
                 failures.append(_clip_error(path, error))
             abort.set()
             raise failures[0]
         except Exception as e:  # keep the batch going for other file errors
-            return os.path.basename(path), 0, 0.0, 0.0, f"{type(e).__name__}: {e}", 0.0, 0.0, time.perf_counter(), 0
+            return _relative_path(path, c), 0, 0.0, 0.0, f"{type(e).__name__}: {e}", 0.0, 0.0, time.perf_counter(), 0
 
     results = []
     # Workers alternate short GIL-holding Python (loading, saving) with long GIL-free native calls;
@@ -397,12 +401,12 @@ def run(cfg) -> int:
                 _check_keypoints(tg, keypoints, path)
                 t1 = time.perf_counter()
                 if abs(tg.fps - tg0.fps) > 1e-6:
-                    print(f"[frdv] warning: {os.path.basename(path)} is {tg.fps:g} fps but the joint velocity cap "
+                    print(f"[frdv] warning: {_relative_path(path, c)} is {tg.fps:g} fps but the joint velocity cap "
                           f"was set for {tg0.fps:g} fps")
                 q, rep = pr.run(tg.X, return_report=True)
                 ds = postprocess(pr.local, c["solver"], tg.X, q, tg.fps)
                 if ds:
-                    print(f"[frdv] {os.path.basename(path)} despike: {ds}")
+                    print(f"[frdv] {_relative_path(path, c)} despike: {ds}")
                 results.append((_save(path, out, tg, q, c, ik, joints), len(q), t1 - t0, time.perf_counter() - t1, None))
                 print(f"[frdv] {results[-1][0]}: {rep}")
     elif mode in ("sequential", "files") and (workers == 1 or len(files) == 1 or mode == "sequential") \
