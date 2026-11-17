@@ -184,3 +184,33 @@ def test_failed_clips_are_named_by_their_path_in_the_data_folder(monkeypatch,tmp
     paths = [str(tmp_path/s/'0005_Walking001_poses.npz') for s in ('s1','s2')]
     assert [retarget._job(p)[::4] for p in paths] == [('s1/0005_Walking001_poses.npz','OSError: unreadable'),
                                                        ('s2/0005_Walking001_poses.npz','OSError: unreadable')]
+
+
+def _save_args(tmp_path):
+    tg = SimpleNamespace(fps=30.,X=np.zeros((2,1,3)),keypoints=['pelvis'],source_joints=['Hips'],skeleton=None)
+    cfg = {'data':str(tmp_path/'data'),'robot':{'name':'g1'},'dataset':{'name':'amass'}}
+    q = np.zeros((2,7)); q[:,3] = 1
+    (tmp_path/'data'/'s1').mkdir(parents=True)
+    return str(tmp_path/'data'/'s1'/'walk.npz'),str(tmp_path/'out'),tg,q,cfg,SimpleNamespace(targets=['pelvis'],xml_path='toy.xml'),['root']
+
+
+def test_output_is_written_whole_or_not_at_all(monkeypatch,tmp_path):
+    import os
+    from frdv.cli import retarget
+    args = _save_args(tmp_path)
+    assert retarget._save(*args) == 's1/walk'
+    out = tmp_path/'out'/'s1'
+    assert [p.name for p in out.iterdir()] == ['walk.npz']
+    with np.load(out/'walk.npz') as z:
+        np.testing.assert_array_equal(z['qpos'],args[3])
+    (tmp_path/'plain').write_bytes(b'')  # same permissions as a file created in place
+    assert os.stat(out/'walk.npz').st_mode == os.stat(tmp_path/'plain').st_mode
+    before = (out/'walk.npz').read_bytes()
+    def interrupted(file,**arrays):
+        with open(file,'wb') if isinstance(file,str) else file as f:
+            f.write(b'PK partial')
+        raise KeyboardInterrupt
+    monkeypatch.setattr(retarget.np,'savez',interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        retarget._save(*args)
+    assert [p.name for p in out.iterdir()] == ['walk.npz'] and (out/'walk.npz').read_bytes() == before

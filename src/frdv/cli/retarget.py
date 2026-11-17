@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 
 from .common import THREAD_VARS
@@ -105,14 +106,24 @@ def _save(path, out_dir, tg, q, cfg, ik, joint_names):
     if tg.skeleton is not None:
         extra = dict(skeleton=tg.skeleton.astype(np.float32), skeleton_parents=np.array(tg.skeleton_parents))
     subject = cfg.get("subject") or {}
-    np.savez(destination, qpos=q, fps=tg.fps, targets=tg.X.astype(np.float32),
-             keypoints=np.array(tg.keypoints), source_joints=np.array(tg.source_joints),
-             robot_links=np.array([t[0] if isinstance(t, (tuple, list)) else t for t in ik.targets]),
-             robot_link_offsets=np.array([t[1] if isinstance(t, (tuple, list)) else (0.0, 0.0, 0.0) for t in ik.targets],
-                                         dtype=float),
-             joint_names=np.array(joint_names), robot_xml=ik.xml_path,
-             robot=cfg["robot"]["name"], dataset=cfg["dataset"]["name"], source=path,
-             subject=subject.get("name") or "", collection=subject.get("collection") or "", **extra)
+    # Write a temporary file next to the destination and rename it, so an interrupted write never leaves
+    # a partial npz; np.savez gets a file object because it appends its extension to a file name.
+    tmp = f"{destination}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            np.savez(f, qpos=q, fps=tg.fps, targets=tg.X.astype(np.float32),
+                     keypoints=np.array(tg.keypoints), source_joints=np.array(tg.source_joints),
+                     robot_links=np.array([t[0] if isinstance(t, (tuple, list)) else t for t in ik.targets]),
+                     robot_link_offsets=np.array([t[1] if isinstance(t, (tuple, list)) else (0.0, 0.0, 0.0)
+                                                  for t in ik.targets], dtype=float),
+                     joint_names=np.array(joint_names), robot_xml=ik.xml_path,
+                     robot=cfg["robot"]["name"], dataset=cfg["dataset"]["name"], source=path,
+                     subject=subject.get("name") or "", collection=subject.get("collection") or "", **extra)
+        os.replace(tmp, destination)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
     return name
 
 
