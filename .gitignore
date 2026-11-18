@@ -24,3 +24,4 @@ MUJOCO_LOG.TXT
 # Local benchmark implementation and raw outputs; publish only the timing summary
 /benchmarks/*
 !/benchmarks/benchmark_nov_8_2026.md
+!/benchmarks/amass_g1_pyroki_comparison_nov_17_2026.md
