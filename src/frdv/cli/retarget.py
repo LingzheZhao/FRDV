@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 
 from .common import THREAD_VARS
@@ -49,6 +50,20 @@ def _loader_opts(ds: dict) -> dict:
 def _clip_error(path, error):
     message = str(error)
     return ValidationError(message if message.startswith(f"{path}:") else f"{path}: {message}")
+
+
+def _relative_path(path, cfg):
+    """Path of a clip relative to the data folder, or its basename when `data` is one motion file."""
+    data_root = resolve_path(cfg["data"])
+    return os.path.relpath(path, data_root) if os.path.isdir(data_root) else os.path.basename(path)
+
+
+def _failed_result(path, error, cfg):
+    """Per-clip result tuple of a failed clip; the error message drops its path prefix."""
+    message = str(error)
+    if message.startswith(f"{path}: "):
+        message = message[len(path) + 2:]
+    return _relative_path(path, cfg), 0, 0.0, 0.0, f"{type(error).__name__}: {message}"
 
 
 def prepare(path: str, cfg: dict, height: float, keep_skeleton=False):
@@ -84,23 +99,31 @@ def _save(path, out_dir, tg, q, cfg, ik, joint_names):
     from ..utils import continuous_quaternions
     q = trajectory_array(q, len(tg.X), len(ik.q_nominal) if getattr(ik, 'q_nominal', None) is not None else None)
     continuous_quaternions(q)
-    data_root = resolve_path(cfg["data"])
-    relative = os.path.relpath(path, data_root) if os.path.isdir(data_root) else os.path.basename(path)
-    name = os.path.splitext(relative)[0]
+    name = os.path.splitext(_relative_path(path, cfg))[0]
     destination = os.path.join(out_dir, f"{name}.npz")
     os.makedirs(os.path.dirname(destination), exist_ok=True)
     extra = {}
     if tg.skeleton is not None:
         extra = dict(skeleton=tg.skeleton.astype(np.float32), skeleton_parents=np.array(tg.skeleton_parents))
     subject = cfg.get("subject") or {}
-    np.savez(destination, qpos=q, fps=tg.fps, targets=tg.X.astype(np.float32),
-             keypoints=np.array(tg.keypoints), source_joints=np.array(tg.source_joints),
-             robot_links=np.array([t[0] if isinstance(t, (tuple, list)) else t for t in ik.targets]),
-             robot_link_offsets=np.array([t[1] if isinstance(t, (tuple, list)) else (0.0, 0.0, 0.0) for t in ik.targets],
-                                         dtype=float),
-             joint_names=np.array(joint_names), robot_xml=ik.xml_path,
-             robot=cfg["robot"]["name"], dataset=cfg["dataset"]["name"], source=path,
-             subject=subject.get("name") or "", collection=subject.get("collection") or "", **extra)
+    # Write a temporary file next to the destination and rename it, so an interrupted write never leaves
+    # a partial npz; np.savez gets a file object because it appends its extension to a file name.
+    tmp = f"{destination}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            np.savez(f, qpos=q, fps=tg.fps, targets=tg.X.astype(np.float32),
+                     keypoints=np.array(tg.keypoints), source_joints=np.array(tg.source_joints),
+                     robot_links=np.array([t[0] if isinstance(t, (tuple, list)) else t for t in ik.targets]),
+                     robot_link_offsets=np.array([t[1] if isinstance(t, (tuple, list)) else (0.0, 0.0, 0.0)
+                                                  for t in ik.targets], dtype=float),
+                     joint_names=np.array(joint_names), robot_xml=ik.xml_path,
+                     robot=cfg["robot"]["name"], dataset=cfg["dataset"]["name"], source=path,
+                     subject=subject.get("name") or "", collection=subject.get("collection") or "", **extra)
+        os.replace(tmp, destination)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
     return name
 
 
@@ -139,9 +162,25 @@ def _job(path):
         name = _save(path, _W["cfg"]["out"], tg, q, _W["cfg"], _W["ik"], _W["joints"])
         return name, len(q), t1 - t0, t2 - t1, None
     except ValidationError as error:
+        if not _W["cfg"].get("fail_fast"):
+            return _failed_result(path, error, _W["cfg"])
         raise _clip_error(path, error) from error
     except Exception as e:  # keep the batch going for other file errors
-        return os.path.basename(path), 0, 0.0, 0.0, f"{type(e).__name__}: {e}"
+        return _relative_path(path, _W["cfg"]), 0, 0.0, 0.0, f"{type(e).__name__}: {e}"
+
+
+def _first_clip(files, c, height):
+    """(path, targets, failed results) for the first clip that loads; the clips before it that fail are
+    returned as failed results, or raise when fail_fast is set. (None, None, failed results) if none loads."""
+    failed = []
+    for path in files:
+        try:
+            return path, prepare(path, c, height, c.get("save_skeleton", False)), failed
+        except Exception as error:
+            if c.get("fail_fast"):
+                raise
+            failed.append(_failed_result(path, error, c))
+    return None, None, failed
 
 
 def _fused_ok(c, height, keypoints) -> bool:
@@ -246,12 +285,14 @@ def _run_threads(files, c, height, workers, first=(None, None)):
             t3 = time.perf_counter()
             return name, len(q), t1 - t0, t2 - t1, None, t3 - t2, time.thread_time() - c0, t3, threading.get_ident()
         except ValidationError as error:
+            if not c.get("fail_fast"):
+                return _failed_result(path, error, c) + (0.0, 0.0, time.perf_counter(), 0)
             if not failures:
                 failures.append(_clip_error(path, error))
             abort.set()
             raise failures[0]
         except Exception as e:  # keep the batch going for other file errors
-            return os.path.basename(path), 0, 0.0, 0.0, f"{type(e).__name__}: {e}", 0.0, 0.0, time.perf_counter(), 0
+            return _relative_path(path, c), 0, 0.0, 0.0, f"{type(e).__name__}: {e}", 0.0, 0.0, time.perf_counter(), 0
 
     results = []
     # Workers alternate short GIL-holding Python (loading, saving) with long GIL-free native calls;
@@ -305,6 +346,7 @@ def run(cfg) -> int:
         print(f"no files matching '{c['dataset'].get('glob')}' in {c['data']}")
         return 2
     validate_subject_input(c, files)
+    c["fail_fast"] = bool(c.get("fail_fast")) or len(files) == 1
     out = os.path.abspath(os.path.expanduser(c["out"]))
     from .diagnostics import warn_source_overwrite
     warn_source_overwrite(files, out, resolve_path(c['data']))
@@ -328,13 +370,18 @@ def run(cfg) -> int:
 
     _tick("robot validated, calibration found")
     # Tracked keypoints = robot keypoints present in the dataset map (checked on the first clip).
-    files_in = list(files)
-    tg0 = prepare(files[0], c, height, c.get("save_skeleton", False))
+    first, tg0, failed = _first_clip(files, c, height)
+    if tg0 is None:
+        for n, *_, e in failed:
+            print(f"[frdv] FAILED {n}: {e}")
+        print(f"[frdv] 0/{len(failed)} clips: no clip could be loaded")
+        return 1
+    files = files[len(failed):]
     _tick("first clip loaded")
     keypoints = tg0.keypoints
     skipped = [k for k, v in c["robot"]["keypoints"].items()
                if k not in keypoints and not v.get("calibrate")]
-    print(f"[frdv] robot={c['robot']['name']} dataset={c['dataset']['name']}  {len(files)} file(s) -> {out}")
+    print(f"[frdv] robot={c['robot']['name']} dataset={c['dataset']['name']}  {len(failed) + len(files)} file(s) -> {out}")
     scale_label = "manual source XYZ scale" if c["dataset"].get("scale", {}).get("mode") == "manual" else "scale"
     print(f"[frdv] tracking {len(keypoints)} keypoints; robot height {height:.2f} m, "
           f"performer {tg0.human_height:.2f} m " + (_seg_report(tg0) if tg0.segment_scale else
@@ -365,17 +412,17 @@ def run(cfg) -> int:
                 _check_keypoints(tg, keypoints, path)
                 t1 = time.perf_counter()
                 if abs(tg.fps - tg0.fps) > 1e-6:
-                    print(f"[frdv] warning: {os.path.basename(path)} is {tg.fps:g} fps but the joint velocity cap "
+                    print(f"[frdv] warning: {_relative_path(path, c)} is {tg.fps:g} fps but the joint velocity cap "
                           f"was set for {tg0.fps:g} fps")
                 q, rep = pr.run(tg.X, return_report=True)
                 ds = postprocess(pr.local, c["solver"], tg.X, q, tg.fps)
                 if ds:
-                    print(f"[frdv] {os.path.basename(path)} despike: {ds}")
+                    print(f"[frdv] {_relative_path(path, c)} despike: {ds}")
                 results.append((_save(path, out, tg, q, c, ik, joints), len(q), t1 - t0, time.perf_counter() - t1, None))
                 print(f"[frdv] {results[-1][0]}: {rep}")
     elif mode in ("sequential", "files") and (workers == 1 or len(files) == 1 or mode == "sequential") \
             and _fused_ok(c, height, keypoints):
-        results = _run_threads(files, c, height, 1, first=(files_in[0], tg0))
+        results = _run_threads(files, c, height, 1, first=(first, tg0))
     elif mode == "sequential" or workers == 1 or len(files) == 1:
         _init(c, height, keypoints)
         for path in files:
@@ -384,7 +431,7 @@ def run(cfg) -> int:
         # One process, one thread per worker: the whole clip (solve + despike) runs in one GIL-free
         # compiled call, so there is no process start-up and nothing to pickle.
         files.sort(key=os.path.getsize, reverse=True)  # longest first: better load balance
-        results = _run_threads(files, c, height, workers, first=(files_in[0], tg0))
+        results = _run_threads(files, c, height, workers, first=(first, tg0))
     elif mode == "files":
         files.sort(key=os.path.getsize, reverse=True)  # longest first: better load balance
         # Compile the numba kernels once here; the workers then load them from numba's on-disk
@@ -404,6 +451,7 @@ def run(cfg) -> int:
         return 2
     wall = time.perf_counter() - t_start
     _tick("all clips done")
+    results = failed + results
 
     errors = [(n, e) for n, *_, e in results if e]
     for n, e in errors:
